@@ -258,6 +258,46 @@ new version and do not re-run blindly: repair the schema or restore the backup,
 then bring the service up. The migrator deliberately does not expose a force
 command.
 
+### Search indexes and pg_trgm
+
+Migration 19 installs the `pg_trgm` extension and adds GIN trigram indexes
+for search (`?q=`). Without them, every search reads the `contracts` and
+`specs` tables in full, which is fine for a few thousand contracts but slow
+for hundreds of thousands.
+
+The indexes are optional. On PostgreSQL 13 and later `pg_trgm` is a trusted
+extension, so a role with `CREATE` on the database can install it. If the
+migration role lacks that privilege, or the server does not ship the contrib
+extensions, the migration does not fail. It logs a NOTICE, skips the indexes
+and still reaches the latest version. Search returns the same results without
+them, only more slowly.
+
+To add the indexes later, have a role that may do so install the extension,
+then create the indexes as the table owner:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE INDEX IF NOT EXISTS contracts_contract_id_trgm ON contracts USING gin (contract_id gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS contracts_name_trgm ON contracts USING gin (name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS specs_symbols_trgm ON specs USING gin (symbols gin_trgm_ops);
+```
+
+If the extension lives in a schema outside `search_path` (some providers use
+`extensions`), qualify the operator class, for example
+`extensions.gin_trgm_ops`. On a large, busy table, use
+`CREATE INDEX CONCURRENTLY` (outside a transaction) so writes are not blocked
+while it builds. The migration cannot do that itself, because migrations run
+inside a transaction.
+
+The migration builds the indexes with a plain `CREATE INDEX`, which blocks
+writes to the table while it runs. That takes seconds for a typical registry,
+but on a very large one you may prefer to create the indexes concurrently, as
+above, before upgrading. The migration skips any that already exist, so if a
+concurrent build failed, drop the INVALID index it left behind first.
+
+Queries of one or two characters cannot be narrowed by trigrams. They still
+return correct results, just at about the speed they had before the indexes.
+
 Rolling back the binary is only safe if the schema is compatible with it.
 The migrations currently shipped are additive, but do not assume that for a
 future release: if a migration removes or changes something the old binary
